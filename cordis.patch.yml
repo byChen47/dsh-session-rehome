@@ -1,0 +1,6 @@
+# This package's bundle layer: one Host plugin row.
+# Listing the package in a profile's package.json -> dsh.profile.bundles (the
+# Plugins page does both steps) turns this row into a Loader entry.
+- insert:
+    - id: session-rehome
+      name: dsh-session-rehome

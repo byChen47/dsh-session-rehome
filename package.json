@@ -1,0 +1,73 @@
+{
+  "name": "dsh-session-rehome",
+  "version": "0.1.0",
+  "description": "Move a DeepSeek Harness conversation into another workspace in place: its log is relocated and its header cwd rewritten, so the session keeps its id, history, title and archive state. The running turn is never touched — a session that is mid-turn is refused instead.",
+  "type": "module",
+  "license": "MIT",
+  "author": "byChen47",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "test/*.test.mjs",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "workspace",
+    "workspaces",
+    "session",
+    "conversation",
+    "move"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/byChen47/dsh-session-rehome.git"
+  },
+  "homepage": "https://github.com/byChen47/dsh-session-rehome#readme",
+  "bugs": {
+    "url": "https://github.com/byChen47/dsh-session-rehome/issues"
+  },
+  "scripts": {
+    "test": "node test/rehome.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    },
+    "catalog": {
+      "summary": {
+        "en": "Move one conversation into another workspace in place: the same session id, history and title, with its log and header cwd relocated.",
+        "zh": "把一条对话原地搬到另一个工作区：会话 id、历史、标题都不变，只搬日志并改写头部的 cwd。"
+      },
+      "category": "workflow"
+    }
+  },
+  "engines": {
+    "node": ">=22.15",
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

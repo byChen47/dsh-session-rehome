@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Relocate session",
+    "description": "Adds \"Move to another workspace…\" to a conversation's row menu: relocates that conversation's log into the target workspace folder, rewrites its header cwd, and updates the workspace membership. The session id, history, title and archive state are preserved."
+  }
+}
