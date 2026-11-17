@@ -18,7 +18,7 @@ import zlib from 'node:zlib'
 
 const here = new URL('../index.js', import.meta.url)
 const { internals } = await import(here.href)
-const { encodeSegment, projectKey, scanZstdFrames, readHeaderFromBuffer, planRelocate, applyRelocate } = internals
+const { encodeSegment, projectKey, scanZstdFrames, readHeaderFromBuffer, planRelocate, applyRelocate, rewriteLogPaths } = internals
 
 const results = []
 const check = (name, ok, detail = '') => {
@@ -119,6 +119,33 @@ check('never overwrites the existing target log', (() => {
 })())
 
 rmSync(root, { recursive: true, force: true })
+
+// ---- 路径改写：只动命中的帧，其它帧逐字节不变 ------------------------------
+const oldFile = FROM + '\\reports\\r1.md'
+const newFile = TO + '\\reports\\r1.md'
+// `arguments` 本身是 JSON 字符串，路径在日志里因此被转义两次（四层反斜杠）；
+// 头部的 cwd 是普通字段，只转义一次。
+const escapedOnce = (path) => path.split('\\').join('\\\\')
+const escaped = (path) => escapedOnce(escapedOnce(path))
+
+const pathLog = Buffer.concat([
+  frame(JSON.stringify({ type: 'session', version: 4, id: ID, createdAt: 1, cwd: FROM, isSeeded: false, delegationDepth: 0 }) + '\n'),
+  frame(JSON.stringify({ type: 'tool/call', seq: 3, data: { name: 'write', arguments: JSON.stringify({ file_path: oldFile }) } }) + '\n'),
+  frame(JSON.stringify({ type: 'turn/end', seq: 4, data: {} }) + '\n'),
+])
+
+const rewrittenPaths = rewriteLogPaths(pathLog, [[escaped(oldFile), escaped(newFile)]], true)
+const pathBefore = scanZstdFrames(pathLog).frames
+const pathAfter = scanZstdFrames(rewrittenPaths.buffer).frames
+const decode = (buffer, index) => Buffer.from(zlib.zstdDecompressSync(buffer.subarray(pathAfter[index].start, pathAfter[index].end))).toString('utf8')
+
+check('path rewrite touches exactly one frame', rewrittenPaths.changed === 1, String(rewrittenPaths.changed))
+check('frame count is unchanged', pathBefore.length === pathAfter.length)
+check('the untouched frame stays byte-identical', pathLog.subarray(pathBefore[2].start, pathBefore[2].end).equals(rewrittenPaths.buffer.subarray(pathAfter[2].start, pathAfter[2].end)))
+check('the recorded path now points at the new workspace', decode(rewrittenPaths.buffer, 1).includes(escaped(newFile)))
+check('the old path is gone from that frame', !decode(rewrittenPaths.buffer, 1).includes(escaped(oldFile)))
+check('the header is untouched by a file-path rewrite', decode(rewrittenPaths.buffer, 0).includes(escapedOnce(FROM)))
+check('no pair means no work at all', rewriteLogPaths(pathLog, [], true).changed === 0 && rewriteLogPaths(pathLog, [], true).buffer === pathLog)
 
 const failed = results.filter((r) => !r.ok)
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`)

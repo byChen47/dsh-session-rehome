@@ -1,7 +1,7 @@
 {
   "name": "dsh-session-rehome",
-  "version": "0.1.0",
-  "description": "Move a DeepSeek Harness conversation into another workspace in place: its log is relocated and its header cwd rewritten, so the session keeps its id, history, title and archive state. The running turn is never touched — a session that is mid-turn is refused instead.",
+  "version": "0.2.0",
+  "description": "Move a DeepSeek Harness conversation into another workspace in place: its log is relocated and its header cwd rewritten, so the session keeps its id, history, title and archive state — and the files that conversation changed can travel with it. The running turn is never touched — a session that is mid-turn is refused instead.",
   "type": "module",
   "license": "MIT",
   "author": "byChen47",
@@ -41,7 +41,7 @@
     "url": "https://github.com/byChen47/dsh-session-rehome/issues"
   },
   "scripts": {
-    "test": "node test/rehome.test.mjs"
+    "test": "node test/rehome.test.mjs && node test/files.test.mjs"
   },
   "dsh": {
     "bundle": {

@@ -27,6 +27,50 @@ dsh plugin --profile <profile> add dsh-session-rehome
 
 如果搬的正是屏幕上打开的那个对话，**刷新一次页面**再打开它 —— 浏览器手里那份是旧的。
 
+## 连文件一起搬
+
+对话干的活通常落在工作区目录里，而不在日志里。所以选好目标工作区后，对话框会同时向 Host 问一句
+**这个对话改过哪些文件**，然后给你三个选择：
+
+- **一起搬过去**（默认）—— 逐个复制到目标工作区，成功后再删除原文件；
+- **复制过去** —— 原文件留在原地；
+- **只搬对话，不带文件** —— 一个文件都不碰。
+
+清单有两个来源，取并集：
+
+1. **会话自己的日志**（主来源，持久）—— 每次 `write` / `edit` 这类工具调用都会把目标路径写进日志，
+   对话**交付过**（`present`）的文件也按名字记在里面。所以一周前的对话和一分钟前的对话一样能列出来，
+   重启也不影响——包括用 shell 脚本生成、但被交付过的文件。
+2. **DSH 的逐轮变更记录**（`ctx.workspaceChanges`，补充）—— 每轮前后的 git 工作树快照 + 整文件
+   副本，连 shell 命令改过的文件也抓得到。
+
+两边都不猜。唯一的盲区是**用 shell 命令创建、又没交付过**的文件：它们只能靠来源 2，而那活在内存里，
+只覆盖 DSH 本次启动之后的轮次。
+
+Host 端强制执行的规矩：
+
+| 情况 | 结果 |
+|---|---|
+| 文件在旧工作区之外（绝对路径、`..`、或符号链接指向别处） | 跳过 |
+| 文件已经不在了 | 跳过 |
+| 目标工作区里已有同一相对路径 | **跳过 —— 永远不覆盖目标文件** |
+| 不是普通文件（目录、符号链接） | 跳过 |
+| 单个超过 32 MiB，或超过 200 个 / 总计 256 MiB | 跳过 |
+| 会话本身没搬成 | 文件一个都不动（先搬会话，再动文件） |
+
+每个跳过都会带上原因；复制模式下源文件会保留到副本确认落盘为止。
+
+文件搬完之后，插件对会话本身还做两件事：
+
+- **改写会话里记录的路径** —— 只改那些**确实搬走/复制过去**的文件，被跳过的文件保留原路径（因为它
+  确实还在原处，这才是诚实的）；
+- **切换会话的工作目录**（走官方 `working-directory/change` 事件）—— 之后的相对路径、工具调用都落在
+  新工作区，而不是继续往旧目录里写。只有已经起了 agent 的会话才有"目录"可切；只是打开着、还没跑过
+  的会话，会在下次被加载时按新的 header 初始化。
+
+屏幕上打开着的那个会话，内存里还是旧的历史：**重新打开它**（或刷新页面）才能看到改写后的路径；
+但下一轮的工具调用已经用新目录了。
+
 ## 它会拒绝的情况
 
 这些情况插件直接返回错误码，一个字节都不动：
@@ -94,20 +138,27 @@ DSH 里"一条会话属于哪个工作区"不是一张能随便改的表，而�
 | 端点 | 方法 | 入参 | 结果 |
 |---|---|---|---|
 | `/session-rehome/workspaces` | GET | — | `{ ok, workspaces: [{ id, title, path, sessionIds }] }` |
-| `/session-rehome/move` | POST | `{ sessionId, workspaceId }` | `{ ok, sessionId, from, to, workspace, storage, memory, ... }` |
+| `/session-rehome/move` | POST | `{ sessionId, workspaceId, files?: "none" \| "copy" \| "move" }` | `{ ok, sessionId, from, to, workspace, storage, memory, files, ... }` |
+| `/session-rehome/file-plan` | POST | `{ sessionId, workspaceId }` | `{ ok, available, files, skipped, totalBytes, reason? }` —— 只预览，不改任何东西 |
 
 ## 自测
 
 ```bash
-npm test    # node test/rehome.test.mjs
+npm test    # node test/rehome.test.mjs && node test/files.test.mjs
 ```
 
-20 项检查，全部现场合成数据、不碰任何真实会话：帧结构、字节守恒、header 封闭键集与键序、
-目录名与 `projectKey(cwd)` 的一致性，以及各种拒绝条件。
+两个套件共 43 项检查，全部现场合成数据、不碰任何真实会话或工作区：
+
+- `rehome.test.mjs`（20 项）：帧结构、字节守恒、header 封闭键集与键序、目录名与
+  `projectKey(cwd)` 的一致性，以及各种拒绝条件；
+- `files.test.mjs`（23 项）：路径越界（`..`、绝对路径、符号链接）、文件缺失、**不覆盖**目标已有
+  文件、`copy` 保留源文件、`move` 只在复制落盘后才删源、嵌套目标目录、目录被跳过。
 
 ## 已知限制
 
 - **正在跑一轮的会话搬不了**，等它跑完再搬（这是刻意的安全取舍，见上）。
+- **只用 shell 创建、且从未交付的文件是盲区**：它们只能通过内存摘要列出，也就是只覆盖 DSH 本次启动
+  之后的轮次。交付（`present`）一次就能让它变成持久可查的。
 - 一个会话同时只能属于一个工作区 —— 这是 DSH 的模型，不是插件的选择。
 - 用的是几个包私有入口（`sessionPersistence.tracker.writers`、`workspaceRegistry.headers`、
   `replaceHeaderIndex`、写句柄的 `header` 槽位）。每一处都做了 feature-detect：探测不到就

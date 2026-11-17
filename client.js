@@ -20,6 +20,7 @@ window.__ModuleLoader__.load({
     const NS = 'session-rehome'
     const ENDPOINT = '/session-rehome/move'
     const WORKSPACES_ENDPOINT = '/session-rehome/workspaces'
+    const FILE_PLAN_ENDPOINT = '/session-rehome/file-plan'
     const MENU_SLOT = 'sidebar.workspaces.session.menu.item'
     const OVERLAY_SLOT = 'shell.overlay'
     const MENU_ORDER = 360
@@ -28,7 +29,7 @@ window.__ModuleLoader__.load({
       en: {
         'menu.label': 'Move to another workspace…',
         'title': 'Move this conversation',
-        'description': '“{title}” moves into the workspace you pick: history, title and archive state stay, and the conversation id does not change. Nothing is copied.',
+        'description': '“{title}” moves into the workspace you pick: history, title and archive state stay, and the conversation id does not change.',
         'pick': 'Move into',
         'none': 'This conversation is already in every workspace. Create another workspace first.',
         'empty': 'No workspace is available, or the list could not be loaded.',
@@ -39,11 +40,27 @@ window.__ModuleLoader__.load({
         'notStored': 'This conversation has never been written to disk (no message sent yet), so there is nothing to move.',
         'failed': 'The move failed: {detail}',
         'owner': 'current',
+        'files.title': 'Files this conversation changed',
+        'files.summary': '{count} file(s), {size} in total',
+        'files.skipped': '{count} skipped (already in the target, missing, or outside the workspace)',
+        'files.mode.move': 'Move them (delete from the old workspace)',
+        'files.mode.copy': 'Copy them (keep the originals)',
+        'files.mode.none': 'Session only',
+        'files.more': '…and {count} more',
+        'files.none': 'This conversation left no movable files in the old workspace.',
+        'files.loading': 'Checking which files it changed…',
+        'files.loadFailed': 'The file list could not be read.',
+        'files.notLive': 'Cannot tell which files it changed: it has not been opened since DSH started. Open it once and try again.',
+        'files.noTracker': 'This build does not record per-turn file changes, so its files cannot be listed.',
+        'files.alreadyThere': 'The conversation already lives in that folder, so its files do not need to move.',
+        'files.result': '{applied} file(s) {verb}, {failed} failed.',
+        'files.verb.move': 'moved',
+        'files.verb.copy': 'copied',
       },
       zh: {
         'menu.label': '移动到其他工作区…',
         'title': '移动这个对话',
-        'description': '「{title}」会搬进你选的工作区：历史、标题、归档状态都保留，会话 id 不变，不会复制出一份新的。',
+        'description': '「{title}」会搬进你选的工作区：历史、标题、归档状态都保留，会话 id 不变。',
         'pick': '移动到',
         'none': '它已经在所有工作区里了。先创建另一个工作区再来。',
         'empty': '没有可用工作区，或者列表没取到。',
@@ -54,8 +71,25 @@ window.__ModuleLoader__.load({
         'notStored': '这条对话还没有落盘（没发过消息），没有可搬的东西。',
         'failed': '移动失败：{detail}',
         'owner': '当前',
+        'files.title': '这个对话改过的文件',
+        'files.summary': '共 {count} 个文件，{size}',
+        'files.skipped': '{count} 个跳过（目标已存在、文件缺失或超出工作区）',
+        'files.mode.move': '一起搬过去（从原工作区删除）',
+        'files.mode.copy': '复制过去（保留原文件）',
+        'files.mode.none': '只搬对话，不带文件',
+        'files.more': '还有 {count} 个',
+        'files.none': '这个对话没有在旧工作区留下可搬的文件。',
+        'files.loading': '正在确认它改过哪些文件…',
+        'files.loadFailed': '文件清单没读到。',
+        'files.notLive': '无法确定它改过哪些文件：DSH 启动后它还没被打开过。先打开它一次再搬。',
+        'files.noTracker': '这个构建没有开启逐轮文件变更记录，列不出它改过哪些文件。',
+        'files.alreadyThere': '对话已经在这个工作区目录里了，文件不需要搬。',
+        'files.result': '{applied} 个文件已{verb}，{failed} 个失败。',
+        'files.verb.move': '搬迁',
+        'files.verb.copy': '复制',
       },
     }
+
 
     // 菜单随弹窗一起卸载，所以待处理的请求放在模块作用域，由 shell overlay 渲染。
     let request = null
@@ -83,6 +117,14 @@ window.__ModuleLoader__.load({
 
     /** 相对 `document.baseURI` 取路径：Electron 窗口下页面走自定义协议，硬编码端口会失效。 */
     const apiUrl = (path) => (typeof document === 'undefined' ? path : new URL(path.replace(/^\/+/, ''), document.baseURI).pathname)
+
+    /** 人类可读的字节数。 */
+    function formatBytes(bytes) {
+      const value = Number(bytes) || 0
+      if (value < 1024) return `${value} B`
+      if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+      return `${(value / (1024 * 1024)).toFixed(1)} MB`
+    }
 
     // ------------------------------------------------------------------
     // 样式（全部走主题 token，跟随明暗主题）
@@ -220,11 +262,53 @@ window.__ModuleLoader__.load({
       const [selected, setSelected] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState(null)
+      const [plan, setPlan] = React.useState(null)
+      const [planState, setPlanState] = React.useState('idle')
+      const [fileMode, setFileMode] = React.useState('none')
       const cardRef = React.useRef(null)
       const restoreFocusRef = React.useRef(null)
 
       const choices = (all ?? []).filter((workspace) => !workspace.sessionIds.includes(request.sessionId))
       const choiceKey = choices.map((workspace) => workspace.id).join('|')
+
+      // 选中目标后问一次 Host：这个对话改过哪些文件、能不能一起带过去。
+      React.useEffect(() => {
+        if (selected === null) {
+          setPlan(null)
+          setPlanState('idle')
+          return undefined
+        }
+        let live = true
+        setPlanState('loading')
+        setPlan(null)
+        fetch(apiUrl(FILE_PLAN_ENDPOINT), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId: request.sessionId, workspaceId: selected }),
+        })
+          .then((response) => response.json())
+          .then((payload) => {
+            if (!live) return
+            setPlan(payload?.ok === true ? payload : { available: false, reason: 'plan-failed', files: [], skipped: [] })
+            setPlanState('ready')
+          })
+          .catch(() => {
+            if (!live) return
+            setPlan({ available: false, reason: 'plan-failed', files: [], skipped: [] })
+            setPlanState('ready')
+          })
+        return () => {
+          live = false
+        }
+      }, [selected, request.sessionId])
+
+      // 有文件时默认「一起搬过去」，没有就只能是「只搬对话」。
+      React.useEffect(() => {
+        if (plan === null) return
+        const movable = plan.available === true && Array.isArray(plan.files) && plan.files.length > 0
+        setFileMode(movable ? 'move' : 'none')
+      }, [plan])
+
 
       React.useEffect(() => {
         let live = true
@@ -287,7 +371,7 @@ window.__ModuleLoader__.load({
           const response = await fetch(apiUrl(ENDPOINT), {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ sessionId: request.sessionId, workspaceId: selected }),
+            body: JSON.stringify({ sessionId: request.sessionId, workspaceId: selected, files: fileMode }),
           })
           const payload = await response.json().catch(() => null)
           if (!response.ok || payload?.ok !== true) throw new Error(localizeFailure(payload, t))
@@ -348,6 +432,80 @@ window.__ModuleLoader__.load({
               ),
             )
 
+      // ---- 随迁文件：预览 + 三选一 ----------------------------------------
+      const modeStyle = (active, disabled) => ({
+        display: 'flex',
+        alignItems: 'center',
+        gap: '8px',
+        width: '100%',
+        boxSizing: 'border-box',
+        padding: '6px 10px',
+        borderRadius: '8px',
+        border: active ? '1px solid var(--dsw-alias-label-primary)' : '0.5px solid var(--dsw-alias-border-l2)',
+        background: active ? 'var(--dsw-alias-bg-layer-2)' : 'transparent',
+        color: 'var(--dsw-alias-label-primary)',
+        font: 'inherit',
+        fontSize: '13px',
+        lineHeight: '18px',
+        textAlign: 'left',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+      })
+
+      const fileBlock = (() => {
+        if (planState === 'loading') return h('p', { style: descriptionStyle }, t('files.loading'))
+        if (planState !== 'ready' || plan === null) return null
+        const heading = h('div', { style: { ...descriptionStyle, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' } }, t('files.title'))
+        if (plan.available !== true) {
+          const key = plan.reason === 'session-not-live'
+            ? 'files.notLive'
+            : plan.reason === 'no-change-tracker'
+              ? 'files.noTracker'
+              : plan.reason === 'already-there'
+                ? 'files.alreadyThere'
+                : 'files.loadFailed'
+          return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '4px' } }, heading, h('p', { style: descriptionStyle }, t(key)))
+        }
+        const files = Array.isArray(plan.files) ? plan.files : []
+        if (files.length === 0) {
+          return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '4px' } }, heading, h('p', { style: descriptionStyle }, t('files.none')))
+        }
+        const skipped = Array.isArray(plan.skipped) ? plan.skipped.length : 0
+        return h(
+          'div',
+          { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+          heading,
+          h('p', { style: descriptionStyle }, t('files.summary', { count: files.length, size: formatBytes(plan.totalBytes ?? 0) })),
+          skipped > 0 ? h('p', { style: { ...descriptionStyle, fontSize: '12px' } }, t('files.skipped', { count: skipped })) : null,
+          h(
+            'div',
+            { role: 'radiogroup', 'aria-label': t('files.title'), style: { display: 'flex', flexDirection: 'column', gap: '4px' } },
+            ...['move', 'copy', 'none'].map((mode) =>
+              h(
+                'button',
+                {
+                  key: mode,
+                  type: 'button',
+                  role: 'radio',
+                  'aria-checked': fileMode === mode,
+                  disabled: busy,
+                  onClick: () => setFileMode(mode),
+                  style: modeStyle(fileMode === mode, busy),
+                },
+                t('files.mode.' + mode),
+              ),
+            ),
+          ),
+          h(
+            'ul',
+            { style: { ...listStyle, maxHeight: '16vh', margin: 0, paddingLeft: '18px' } },
+            ...files.slice(0, 4).map((file) =>
+              h('li', { key: file.path, style: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)', wordBreak: 'break-all' } }, file.path),
+            ),
+          ),
+          files.length > 4 ? h('p', { style: { ...descriptionStyle, fontSize: '12px' } }, t('files.more', { count: files.length - 4 })) : null,
+        )
+      })()
+
       return h(
         'div',
         {
@@ -362,6 +520,7 @@ window.__ModuleLoader__.load({
           h('h2', { style: titleStyle }, t('title')),
           h('p', { style: descriptionStyle }, t('description', { title: request.displayTitle ?? request.sessionId })),
           body,
+          fileBlock,
           error === null ? null : h('p', { style: { ...descriptionStyle, color: 'var(--dsw-alias-label-error, #d33)' }, role: 'alert' }, error),
           h(
             'div',

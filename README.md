@@ -35,6 +35,53 @@ refresh the page so the menu item appears.
 If you moved the conversation that is currently open on screen, **refresh the page once** before
 opening it again — the browser still holds the old copy.
 
+## Bringing the files along
+
+A conversation's work usually lands in the workspace folder, not in its log. When you pick a target
+workspace the dialog also asks the Host **which files that conversation changed**, and offers three
+choices:
+
+- **Move them** (default) — copy each file into the target workspace, then delete the original;
+- **Copy them** — leave the originals where they are;
+- **Session only** — do not touch any file.
+
+The list has two sources, merged:
+
+1. **The conversation's own log** (primary, durable) — every `write` / `edit`-style tool call records its
+   target path, and every file the conversation *delivered* (`present`) is recorded by name. That covers
+   a conversation from last week as well as one from a minute ago, even after a restart — including files
+   a shell script produced, as long as the conversation delivered them.
+2. **DSH's per-turn change record** (`ctx.workspaceChanges`, supplementary) — git working-tree snapshots
+   around each turn plus whole-file captures, which also catch files a shell command changed.
+
+Neither list is guessed at. The one gap is files a shell command created that the conversation never
+delivered: they appear only through source 2, which lives in memory and therefore covers only turns
+since DSH last started.
+
+Rules, all enforced on the Host:
+
+| Situation | Result |
+|---|---|
+| The file is outside the old workspace (absolute path, `..`, or a symlink pointing elsewhere) | skipped |
+| The file no longer exists | skipped |
+| The same relative path already exists in the target | **skipped — a target file is never overwritten** |
+| Not a regular file (directory, symlink) | skipped |
+| Larger than 32 MiB, or beyond 200 files / 256 MiB total | skipped |
+| The session move fails | files are left untouched (the session moves first) |
+
+Every skip is reported with a reason, and the copy mode keeps the source until its copy is durable.
+
+After the files move, the plugin also does two things to the conversation itself:
+
+- **rewrites the paths recorded inside the conversation** — but only for the files that actually moved or
+  were copied, so a skipped file keeps its old (still true) path;
+- **switches the session's working directory** through the supported `working-directory` event, so later
+  work lands in the new folder instead of the old one. Only an already-running agent has a directory to
+  switch; a conversation that is merely open picks the new one up when it is next materialized.
+
+The conversation on screen still holds its in-memory copy of the old history: **reopen it** (or refresh
+the page) to see the rewritten paths. The next turn's tool calls already use the new directory.
+
 ## What it refuses
 
 Each of these returns a stable error code and touches no bytes:
@@ -110,21 +157,30 @@ Same-origin, owner only. Failures are always `{"ok": false, "code": "...", "mess
 | Endpoint | Method | Body | Result |
 |---|---|---|---|
 | `/session-rehome/workspaces` | GET | — | `{ ok, workspaces: [{ id, title, path, sessionIds }] }` |
-| `/session-rehome/move` | POST | `{ sessionId, workspaceId }` | `{ ok, sessionId, from, to, workspace, storage, memory, ... }` |
+| `/session-rehome/move` | POST | `{ sessionId, workspaceId, files?: "none" \| "copy" \| "move" }` | `{ ok, sessionId, from, to, workspace, storage, memory, files, ... }` |
+| `/session-rehome/file-plan` | POST | `{ sessionId, workspaceId }` | `{ ok, available, files, skipped, totalBytes, reason? }` — preview only |
 
 ## Tests
 
 ```bash
-npm test    # node test/rehome.test.mjs
+npm test    # node test/rehome.test.mjs && node test/files.test.mjs
 ```
 
-20 assertions, all against synthetic data — no real session is touched: frame structure, byte
-preservation, the header's closed key set and key order, the `projectKey(cwd)` ↔ directory-name
-invariant, and every refusal condition.
+43 assertions across two suites, all against synthetic data — no real session or workspace is
+touched:
+
+- `rehome.test.mjs` (20): frame structure, byte preservation, the header's closed key set and key
+  order, the `projectKey(cwd)` ↔ directory-name invariant, and every refusal condition;
+- `files.test.mjs` (23): path containment (`..`, absolute, symlink), missing files, **no overwrite**
+  of an existing target file, `copy` keeps the source, `move` deletes only after a durable copy,
+  nested target directories, directories skipped.
 
 ## Known limits
 
 - **A conversation that is mid-turn cannot be moved** — wait for it to finish.
+- **Shell-only side effects are the blind spot.** A file a shell command created *and* the conversation
+  never delivered is listed only through the in-memory record, i.e. for turns since DSH last started.
+  Delivering it (`present`) is what makes it durable.
 - A session belongs to exactly one workspace; that is DSH's model, not the plugin's choice.
 - It uses a few package-private entry points (`sessionPersistence.tracker.writers`,
   `workspaceRegistry.headers`, `replaceHeaderIndex`, the write handle's `header` slot). Each is

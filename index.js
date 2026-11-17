@@ -23,8 +23,11 @@ import zlib from 'node:zlib'
 import {
   appendFileSync,
   closeSync,
+  constants as fsConstants,
+  copyFileSync,
   existsSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -37,7 +40,7 @@ import {
   writeSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 export const name = 'session-rehome'
 
@@ -50,8 +53,16 @@ const ENDPOINT = '/session-rehome/move'
 /** 浏览器半边用来取工作区列表的同源端点。 */
 const WORKSPACES_ENDPOINT = '/session-rehome/workspaces'
 
+/** 搬迁前预览"会一并带过去哪些文件"。 */
+const FILE_PLAN_ENDPOINT = '/session-rehome/file-plan'
+
 /** 一次请求只有两个 id，8 KiB 足够。 */
 const MAX_BODY_BYTES = 8 * 1024
+
+/** 文件随迁的三条上限，防止一次手滑把整个构建目录搬走。 */
+const MAX_FILES = 200
+const MAX_FILE_BYTES = 32 * 1024 * 1024
+const MAX_TOTAL_BYTES = 256 * 1024 * 1024
 
 /** 规范 generation 文件名：`session.jsonl[.zstd]` / `session.vN.jsonl[.zstd]`。 */
 const GENERATION_NAME = /^session(?:\.v(\d+))?\.jsonl(\.zstd)?$/
@@ -320,7 +331,6 @@ function rewriteHeaderCwd(buffer, newCwd, options) {
 // ---------------------------------------------------------------------------
 // 搬迁计划与落盘
 // ---------------------------------------------------------------------------
-
 /**
  * 找出这条会话的日志目录：先按 header 里的 cwd 推，推不到就扫全部项目目录。
  * @param {string} root 会话根。
@@ -348,6 +358,56 @@ function locateSessionDirs(root, sessionId, storedCwd) {
     found.push(candidate)
   }
   return found
+}
+
+/**
+ * 把日志里记录的旧工作区路径改写成新工作区路径。
+ *
+ * 只替换**确实跟着搬走了**的那些文件（调用方给出精确的前缀对），因此没命中的帧
+ * 会**原样保留原来的字节**——这也是"搬一个文件不该动整份日志"的保证。
+ *
+ * @param {Buffer} buffer 会话日志。
+ * @param {Array<[string, string]>} pairs 字面量替换对（已经按 JSON 转义处理过）。
+ * @param {boolean} compressed 是否 zstd 帧日志。
+ * @returns {{buffer: Buffer, frames: number, changed: number}}
+ */
+function rewriteLogPaths(buffer, pairs, compressed) {
+  if (!Array.isArray(pairs) || pairs.length === 0) return { buffer, frames: 0, changed: 0 }
+  if (compressed !== true) {
+    let text = buffer.toString('utf8')
+    for (const [needle, replacement] of pairs) text = text.split(needle).join(replacement)
+    return { buffer: Buffer.from(text, 'utf8'), frames: 0, changed: pairs.length }
+  }
+  const scan = scanZstdFrames(buffer)
+  if (scan.incomplete || scan.frames.length === 0) return { buffer, frames: 0, changed: 0 }
+  const parts = []
+  let changed = 0
+  for (const frame of scan.frames) {
+    const slice = buffer.subarray(frame.start, frame.end)
+    let text
+    try {
+      text = Buffer.from(zlib.zstdDecompressSync(slice)).toString('utf8')
+    } catch {
+      parts.push(slice)
+      continue
+    }
+    let next = text
+    for (const [needle, replacement] of pairs) {
+      if (next.includes(needle)) next = next.split(needle).join(replacement)
+    }
+    if (next === text) {
+      parts.push(slice)
+      continue
+    }
+    changed++
+    parts.push(zlib.zstdCompressSync(Buffer.from(next, 'utf8'), CHECKSUM_OPTIONS))
+  }
+  return { buffer: Buffer.concat(parts), frames: scan.frames.length, changed }
+}
+
+/** 把 Windows 路径转成它在 JSON 文本里的样子（反斜杠翻倍）。 */
+function jsonEscapedPath(path) {
+  return path.split('\\').join('\\\\')
 }
 
 /**
@@ -492,6 +552,61 @@ function applyRelocate(plan) {
   return report
 }
 
+/**
+ * 把日志里"确实已经搬走"的那些文件的路径改写成新工作区。
+ *
+ * 只动这些精确前缀，其它内容一个字节都不碰；改写后重新校一遍帧结构与头部。
+ *
+ * @param {string} targetPath 目标位置的日志文件。
+ * @param {{compressed: boolean}} generation 该代际的编码方式。
+ * @param {string} fromCwd 旧工作区目录。
+ * @param {string} toCwd 新工作区目录。
+ * @param {Array<{path: string}>} applied 已搬/已复制的文件（相对路径，正斜杠分隔）。
+ * @returns {object} 改写报告。
+ */
+function rewriteSessionPaths(targetPath, generation, fromCwd, toCwd, applied) {
+  const pairs = []
+  for (const file of applied) {
+    if (typeof file?.path !== 'string' || file.path === '') continue
+    // 相对路径可能来自日志（正斜杠）或跳过记录（反斜杠），两种都按分隔符拆。
+    const parts = file.path.split(/[\\/]+/).filter((part) => part !== '')
+    if (parts.length === 0) continue
+    const oldAbs = join(fromCwd, ...parts)
+    const newAbs = join(toCwd, ...parts)
+    // 同一路径在日志里可能是两层转义（普通字段）或四层（`arguments` 本身是 JSON 字符串），
+    // 两种都要换，否则工具调用里记的路径会漏掉。
+    pairs.push([jsonEscapedPath(oldAbs), jsonEscapedPath(newAbs)])
+    pairs.push([jsonEscapedPath(jsonEscapedPath(oldAbs)), jsonEscapedPath(jsonEscapedPath(newAbs))])
+    const oldFwd = oldAbs.split('\\').join('/')
+    if (oldFwd !== oldAbs) pairs.push([oldFwd, newAbs.split('\\').join('/')])
+  }
+  if (pairs.length === 0) return { ok: true, changed: 0, frames: 0 }
+  let buffer
+  try {
+    buffer = readFileSync(targetPath)
+  } catch (error) {
+    return { ok: false, error: messageOf(error), changed: 0 }
+  }
+  const result = rewriteLogPaths(buffer, pairs, generation.compressed)
+  if (result.changed === 0) return { ok: true, changed: 0, frames: result.frames }
+  try {
+    const tmp = targetPath + '.rehome-paths'
+    writeDurable(tmp, result.buffer)
+    renameSync(tmp, targetPath)
+  } catch (error) {
+    return { ok: false, error: messageOf(error), changed: 0 }
+  }
+  const after = readFileSync(targetPath)
+  const header = readHeaderFromBuffer(after, generation.compressed)
+  const scan = scanZstdFrames(after)
+  return {
+    ok: header !== undefined && header.cwd === toCwd && scan.incomplete !== true,
+    changed: result.changed,
+    frames: scan.frames.length,
+    bytes: after.length,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 内存态：让"以后继续写"落到新位置
 // ---------------------------------------------------------------------------
@@ -548,7 +663,7 @@ function redirectMemory(ctx, sessionId, cwd) {
  * @param {string} workspaceId 目标工作区 id。
  * @returns {Promise<object>} 报告。
  */
-async function moveSession(ctx, sessionId, workspaceId, log = () => {}) {
+async function moveSession(ctx, sessionId, workspaceId, log = () => {}, fileMode = 'none') {
   const registry = ctx.workspaceRegistry
   const persistence = ctx.sessionPersistence
   const workspaces = registry.list()
@@ -605,6 +720,8 @@ async function moveSession(ctx, sessionId, workspaceId, log = () => {}) {
   // 先把写句柄里还没落盘的批次刷到**旧**文件里，再搬——否则那批数据会跟着被删的 inode 一起丢。
   await flushWriter(persistence, sessionId)
   const plan = planRelocate({ root, sessionId, toCwd, fromCwd })
+  // 文件清单在搬之前算：日志字节刚刷过，是"搬走之前"的完整样子。
+  const filePlan = fileMode === 'none' ? null : planFileMigration(ctx, sessionId, toCwd, fromCwd, plan.buffer)
   log('info', `relocating ${plan.sourcePath} -> ${plan.targetPath} (${plan.bytesBefore} -> ${plan.bytesAfter} bytes)`)
   const storage = applyRelocate(plan)
   report.storage = storage
@@ -648,8 +765,68 @@ async function moveSession(ctx, sessionId, workspaceId, log = () => {}) {
   } catch (error) {
     report.dshReadbackError = messageOf(error)
   }
+
+  // 会话已经在新工作区了，再动文件。顺序不能反：先搬文件后搬会话的话，
+  // 会话一旦搬失败，文件就已经离开源工作区了。
+  if (filePlan !== null) {
+    report.files = applyFilePlan(filePlan, fileMode)
+    report.files.skipped = filePlan.skipped
+    report.files.discovered = filePlan.discovered
+    report.files.sources = filePlan.sources
+    log('info', `files (${fileMode}): discovered ${filePlan.discovered} (log ${filePlan.sources.log}, summary ${filePlan.sources.summary}); applied ${report.files.applied.length}, failed ${report.files.failed.length}, skipped ${filePlan.skipped.length}`)
+    if (report.files.applied.length > 0) log('info', `  applied: ${report.files.applied.map((entry) => entry.path).join(', ')}`)
+    if (filePlan.skipped.length > 0) log('info', `  skipped: ${filePlan.skipped.map((entry) => `${entry.path}(${entry.reason})`).join(', ')}`)
+
+    // 文件跟着走了，会话里记录的路径也要跟着走——否则卡片和引用仍指向旧工作区。
+    // 范围包含"目标里本来就有、这次只是跳过"的文件：它们的引用同样应该指向新工作区。
+    const shipped = [
+      ...report.files.applied,
+      ...filePlan.skipped.filter((entry) => entry.reason === 'exists').map((entry) => ({ path: entry.path })),
+    ]
+    if (shipped.length > 0) {
+      report.paths = rewriteSessionPaths(plan.targetPath, plan.generation, fromCwd, toCwd, shipped)
+      log('info', `paths: ${report.paths.changed} frame(s) rewritten over ${shipped.length} file(s) ${report.paths.ok === true ? '(ok)' : `(FAILED: ${report.paths.error ?? 'verify failed'})`}`)
+    }
+  }
+
+  // 让 agent 之后的相对路径解析落到新工作区：官方入口会记一条 `working-directory/change`，
+  // 投影随之更新，下一轮的工具调用与提示词上下文都用新目录。
+  report.workingDirectory = await setWorkingDirectory(ctx, sessionId, toCwd)
+  log('info', `working directory: ${report.workingDirectory.applied === true ? 'set to ' + toCwd : 'not changed (' + report.workingDirectory.reason + ')'}`)
+
   report.ok = true
   return report
+}
+
+/**
+ * 把正在使用的 agent 的工作目录切到新工作区。
+ *
+ * 光改 `header.cwd` 不够：`workingDirectory` 是**会话投影**，在会话打开时由
+ * `init: header.cwd` 算出来并存住；不改它的话，之后工具解析相对路径仍然落在旧目录。
+ * 官方入口 `ctx.workingDirectory.set(agent, path)` 会提交一条
+ * `working-directory/change` 事件，投影与提示词上下文一起更新，并且可回放。
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx Host 上下文。
+ * @param {string} sessionId 会话 id。
+ * @param {string} cwd 新目录。
+ * @returns {Promise<{applied: boolean, reason?: string}>}
+ */
+async function setWorkingDirectory(ctx, sessionId, cwd) {
+  let agent
+  try {
+    agent = ctx.get?.('agents')?.get?.(sessionId)
+  } catch {
+    agent = undefined
+  }
+  if (agent === undefined || agent === null) return { applied: false, reason: 'session-has-no-agent' }
+  const service = ctx.get?.('workingDirectory')
+  if (service === undefined || typeof service.set !== 'function') return { applied: false, reason: 'working-directory-unavailable' }
+  try {
+    await service.set(agent, cwd)
+    return { applied: true }
+  } catch (error) {
+    return { applied: false, reason: messageOf(error) }
+  }
 }
 
 /** 安全地读一条会话的头部（先问后端，后端读不到就报 undefined）。 */
@@ -745,9 +922,298 @@ function messageOf(error) {
   return error instanceof Error ? error.message : String(error)
 }
 
+// ---------------------------------------------------------------------------
+// 随迁文件：这个对话在工作区里改过哪些文件，要不要跟着走
+// ---------------------------------------------------------------------------
+//
+// 两个来源，按可靠性排序：
+//
+//   1. **会话日志**（持久、主来源）：每次 `write` / `edit` 这类工具调用都会把目标
+//      绝对路径写进日志，Host 重启、换天、重开都不影响。缺点是不含 shell 里顺手
+//      创建的产物。
+//   2. **`ctx.workspaceChanges` 的逐轮摘要**（补充）：git 工作树快照 + 文件工具
+//      编辑前后的整文件副本，连 shell 改动都抓得到——但它只活在**当前 Host 进程**
+//      里，随会话销毁消失。所以只能当补充，不能当唯一依据。
+//
+// 早先的版本只用 (2)，结果对"昨天干的活"几乎什么都列不出来，白搬一场。
+
+/** 会改动文件的工具名（不同构建叫法不一，用前缀/后缀比较宽松地认）。 */
+const MUTATING_FILE_TOOL = /(^|[^a-z])(write|edit|patch|create|replace|save)([^a-z]|$)/i
+
 /**
- * 纯函数与小工具，供离线自测（`node --test` / 手工脚本）直接调用。
- * 不参与 Host 行为，改它们不影响插件运行。
+ * 从会话日志里挖出这个对话碰过的文件路径。
+ *
+ * @param {Buffer} buffer 会话日志（可以是当前 generation 的完整内容）。
+ * @returns {{paths: string[], toolCalls: number}}
+ */
+function extractFileTouches(buffer) {
+  const paths = new Set()
+  let toolCalls = 0
+  const scan = scanZstdFrames(buffer)
+  for (const frame of scan.frames) {
+    let text
+    try {
+      text = Buffer.from(zlib.zstdDecompressSync(buffer.subarray(frame.start, frame.end))).toString('utf8')
+    } catch {
+      continue
+    }
+    for (const line of text.split('\n')) {
+      // 每个事件一行 JSON；先看首字符，避免对整行做无谓的 JSON.parse。
+      if (line.charCodeAt(0) !== 0x7b) continue
+      let event
+      try {
+        event = JSON.parse(line)
+      } catch {
+        continue
+      }
+      if (event === null || typeof event !== 'object' || event.type !== 'tool/call') continue
+      toolCalls++
+      const name = String(event.data?.name ?? event.data?.tool ?? event.data?.toolName ?? '')
+      // 日志里的 `arguments` 是**字符串化的 JSON**（不是对象），两种形态都认。
+      let args = event.data?.arguments ?? event.data?.args ?? event.data?.input
+      if (typeof args === 'string') {
+        try {
+          args = JSON.parse(args)
+        } catch {
+          continue
+        }
+      }
+      if (args === null || typeof args !== 'object') continue
+      if (MUTATING_FILE_TOOL.test(name)) {
+        const target = args.file_path ?? args.path ?? args.target ?? args.file
+        if (typeof target === 'string' && target !== '') paths.add(target)
+      }
+      // 交付物声明（`present` 之类）：它列的就是"这个对话产出的文件"，往往还是**用
+      // shell 脚本**生成的——那类文件不会被 write/edit 记录，只有这里能拿到。
+      if (Array.isArray(args.files)) {
+        for (const entry of args.files) {
+          const declared = entry?.path ?? entry?.file_path
+          if (typeof declared === 'string' && declared !== '') paths.add(declared)
+        }
+      }
+    }
+  }
+  return { paths: [...paths], toolCalls }
+}
+
+/**
+ * 平台逐轮摘要里的文件（只在会话存活于本进程时可用，仅作补充）。
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx Host 上下文。
+ * @param {string} sessionId 会话 id。
+ * @returns {{available: boolean, turns: number, paths: string[]}}
+ */
+function collectSummaryFiles(ctx, sessionId) {
+  let live
+  try {
+    live = ctx.get('sessions')?.get?.(sessionId)
+  } catch {
+    live = undefined
+  }
+  const changes = ctx.get?.('workspaceChanges')
+  if (live === undefined || changes === undefined || typeof changes.summary !== 'function') {
+    return { available: false, turns: 0, paths: [] }
+  }
+  const paths = []
+  let turns = 0
+  for (const event of Array.isArray(live.log) ? live.log : []) {
+    if (event === null || typeof event !== 'object' || event.type !== 'workspace/changes') continue
+    let summary
+    try {
+      summary = changes.summary(sessionId, event.seq)
+    } catch {
+      summary = undefined
+    }
+    if (summary === undefined || summary === null) continue
+    turns++
+    for (const file of Array.isArray(summary.files) ? summary.files : []) {
+      if (typeof file?.path === 'string' && file.path !== '') paths.push(file.path)
+    }
+  }
+  return { available: true, turns, paths }
+}
+
+/** `child` 是否等于 `root` 或位于其内（都要求已经 realpath 过）。 */
+function isInside(root, child) {
+  const rel = relative(root, child)
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+}
+
+/**
+ * 把一份路径清单分成"能带过去"和"跳过"两类。
+ *
+ * 规矩只有一条是硬性的：**只搬源工作区目录里、真实存在的普通文件，且目标从不覆盖**。
+ * 越界（`..`、符号链接跳到别处）、缺失、目标已存在、过大、超配额，一律跳过并说明原因。
+ *
+ * @param {string[]} paths 变更记录里的路径（会话工作目录内是相对路径，否则是绝对路径）。
+ * @param {string} sourceRoot 源工作区目录。
+ * @param {string} targetRoot 目标工作区目录。
+ * @returns {{included: object[], skipped: object[], totalBytes: number}}
+ */
+function classifyFiles(paths, sourceRoot, targetRoot) {
+  const included = []
+  const skipped = []
+  const source = resolve(sourceRoot)
+  const target = resolve(targetRoot)
+  const seenAbs = new Set()
+  let totalBytes = 0
+  let realSource
+  try {
+    realSource = realpathSync.native(source)
+  } catch {
+    realSource = source
+  }
+
+  for (const raw of paths) {
+    const abs = isAbsolute(raw) ? resolve(raw) : resolve(source, raw)
+    // 同一文件可能被日志与交付物各报一次（一个绝对路径、一个相对路径），只算一次。
+    // 查重必须放在"文件是否存在"之前，否则缺失的文件会被重复报。
+    const absKey = abs.toLowerCase()
+    if (seenAbs.has(absKey)) continue
+    seenAbs.add(absKey)
+    let stats
+    try {
+      stats = lstatSync(abs)
+    } catch {
+      skipped.push({ path: raw, reason: 'missing' })
+      continue
+    }
+    if (!stats.isFile()) {
+      skipped.push({ path: raw, reason: stats.isSymbolicLink() ? 'symlink' : 'not-file' })
+      continue
+    }
+    let realAbs
+    try {
+      realAbs = realpathSync.native(abs)
+    } catch {
+      skipped.push({ path: raw, reason: 'missing' })
+      continue
+    }
+    if (!isInside(realSource, realAbs)) {
+      skipped.push({ path: raw, reason: 'outside' })
+      continue
+    }
+    const rel = relative(realSource, realAbs)
+    if (stats.size > MAX_FILE_BYTES) {
+      skipped.push({ path: rel, reason: 'too-large' })
+      continue
+    }
+    const targetAbs = resolve(target, rel)
+    if (!isInside(target, targetAbs)) {
+      skipped.push({ path: rel, reason: 'outside' })
+      continue
+    }
+    if (existsSync(targetAbs)) {
+      skipped.push({ path: rel, reason: 'exists' })
+      continue
+    }
+    if (included.length >= MAX_FILES) {
+      skipped.push({ path: rel, reason: 'limit' })
+      continue
+    }
+    if (totalBytes + stats.size > MAX_TOTAL_BYTES) {
+      skipped.push({ path: rel, reason: 'limit' })
+      continue
+    }
+    totalBytes += stats.size
+    included.push({ rel: rel.split('\\').join('/'), source: realAbs, target: targetAbs, bytes: stats.size })
+  }
+  return { included, skipped, totalBytes }
+}
+
+/**
+ * 执行文件计划。
+ *
+ * 先 `COPYFILE_EXCL` 复制（目标已存在就报错，绝不覆盖），成功后才在原工作区删除源文件
+ * ——所以 `move` 模式下每一步失败也不会丢数据。
+ *
+ * @param {{included: object[]}} plan {@link classifyFiles} 的结果。
+ * @param {'copy' | 'move'} mode 复制还是移动。
+ * @returns {{mode: string, applied: object[], failed: object[], bytes: number}}
+ */
+function applyFilePlan(plan, mode) {
+  const applied = []
+  const failed = []
+  let bytes = 0
+  for (const file of plan.included) {
+    try {
+      mkdirSync(dirname(file.target), { recursive: true })
+      copyFileSync(file.source, file.target, fsConstants.COPYFILE_EXCL)
+    } catch (error) {
+      failed.push({ path: file.rel, reason: messageOf(error) })
+      continue
+    }
+    if (mode === 'move') {
+      try {
+        rmSync(file.source, { force: true })
+      } catch (error) {
+        failed.push({ path: file.rel, reason: `已复制到新工作区，但删除原文件失败：${messageOf(error)}` })
+        continue
+      }
+    }
+    applied.push({ path: file.rel, bytes: file.bytes })
+    bytes += file.bytes
+  }
+  return { mode, applied, failed, bytes }
+}
+
+/**
+ * 读一条会话当前 generation 的完整字节（预览时要解析里面的工具调用）。
+ *
+ * @param {string} root 会话根。
+ * @param {string} sessionId 会话 id。
+ * @param {string | undefined} storedCwd 头部里记着的 cwd。
+ * @returns {Buffer | undefined}
+ */
+function readSessionLogBuffer(root, sessionId, storedCwd) {
+  const dirs = locateSessionDirs(root, sessionId, storedCwd)
+  if (dirs.length !== 1) return undefined
+  const found = findGeneration(dirs[0])
+  if (found.error !== undefined) return undefined
+  try {
+    return readFileSync(join(dirs[0], found.selected.name))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 算一份"随迁文件"计划（只读）。
+ *
+ * 日志与内存摘要合并取并集：日志覆盖整段历史，摘要补上 shell / git 层面的改动。
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx Host 上下文。
+ * @param {string} sessionId 会话 id。
+ * @param {string} targetRoot 目标工作区目录。
+ * @param {string} sourceRoot 会话当前 cwd（源工作区目录）。
+ * @param {Buffer | undefined} buffer 会话日志字节；给了才会解析工具调用。
+ * @returns {object} 预览（含 `included` 供执行用）。
+ */
+function planFileMigration(ctx, sessionId, targetRoot, sourceRoot, buffer) {
+  const fromLog = buffer === undefined ? [] : extractFileTouches(buffer).paths
+  const summary = collectSummaryFiles(ctx, sessionId)
+  const seen = new Set()
+  for (const path of [...fromLog, ...summary.paths]) {
+    if (typeof path === 'string' && path !== '') seen.add(path)
+  }
+  const files = [...seen]
+  const classified = classifyFiles(files, sourceRoot, targetRoot)
+  return {
+    available: true,
+    discovered: files.length,
+    sources: { log: fromLog.length, summary: summary.turns },
+    source: sourceRoot,
+    target: targetRoot,
+    preview: classified.included.map((file) => ({ path: file.rel, bytes: file.bytes })),
+    skipped: classified.skipped,
+    totalBytes: classified.totalBytes,
+    included: classified.included,
+  }
+}
+
+/**
+ * 纯函数、小工具，以及编排入口 `moveSession`，供离线自测（`node --test` / 手工脚本）
+ * 直接调用。不参与 Host 行为，改它们不影响插件的对外契约。
  */
 export const internals = {
   encodeSegment,
@@ -756,8 +1222,13 @@ export const internals = {
   scanZstdFrames,
   readHeaderFromBuffer,
   rewriteHeaderCwd,
+  rewriteLogPaths,
   planRelocate,
   applyRelocate,
+  classifyFiles,
+  applyFilePlan,
+  extractFileTouches,
+  moveSession,
 }
 
 // ---------------------------------------------------------------------------
@@ -830,7 +1301,79 @@ export function apply(ctx) {
       handler: (request, response) => serveWorkspaces(ctx, request, response),
     }),
   )
-  log('info', `mounted; client bundle: ${clientRowState(ctx)}`)
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: FILE_PLAN_ENDPOINT,
+      handler: (request, response) => serveFilePlan(ctx, request, response),
+    }),
+  )
+  log('info', `mounted; client bundle: ${clientRowState(ctx)}; workspaceChanges: ${ctx.get?.('workspaceChanges') === undefined ? 'absent' : 'present'}`)
+}
+
+/**
+ * 回答一次"随迁文件"预览请求。
+ *
+ * 只回预览，什么都不改：真正执行在 `/move` 里，而且服务端会重新算一遍——客户端
+ * 传回的清单不可信，路径必须由服务端从变更记录重新推导并做越界检查。
+ */
+async function serveFilePlan(ctx, request, response) {
+  try {
+    if (request.method !== 'POST') {
+      respond(response, 405, failure('method-not-allowed', '文件预览用 POST。'))
+      return
+    }
+    if (!admitOwner(ctx, request, response)) return
+    let body
+    try {
+      body = await readJsonBody(request)
+    } catch {
+      respond(response, 400, failure('invalid-body', '请求体不是合法 JSON。'))
+      return
+    }
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      respond(response, 400, failure('invalid-body', '请求体必须是 JSON 对象。'))
+      return
+    }
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+    const workspaceId = typeof body.workspaceId === 'string' ? body.workspaceId : ''
+    if (sessionId === '' || workspaceId === '') {
+      respond(response, 400, failure('invalid-body', 'sessionId 与 workspaceId 都必填。'))
+      return
+    }
+    const target = ctx.workspaceRegistry.list().find((workspace) => String(workspace.id) === workspaceId)
+    if (target === undefined) {
+      respond(response, 404, failure('workspace-not-found', `找不到工作区 ${workspaceId}。`))
+      return
+    }
+    const header = await readStoredHeader(ctx.sessionPersistence, sessionId)
+    if (header === undefined) {
+      respond(response, 404, failure('session-not-found', `读不到会话 ${sessionId} 的头部。`))
+      return
+    }
+    if (typeof header.cwd !== 'string' || header.cwd === '') {
+      respond(response, 409, failure('no-cwd', '这条会话的头部没有记录 cwd。'))
+      return
+    }
+    if (samePath(header.cwd, String(target.path))) {
+      respond(response, 200, { ok: true, available: false, reason: 'already-there', files: [], skipped: [], totalBytes: 0 })
+      return
+    }
+    const root = resolveRoot(ctx.sessionPersistence)
+    const buffer = readSessionLogBuffer(root, sessionId, header.cwd)
+    const plan = planFileMigration(ctx, sessionId, String(target.path), header.cwd, buffer)
+    respond(response, 200, {
+      ok: true,
+      available: plan.available,
+      discovered: plan.discovered,
+      sources: plan.sources,
+      files: plan.preview,
+      skipped: plan.skipped,
+      totalBytes: plan.totalBytes,
+    })
+  } catch (error) {
+    respond(response, 500, failure('plan-failed', `预览失败：${messageOf(error)}`))
+  }
 }
 
 /**
@@ -884,7 +1427,8 @@ async function serveMove(ctx, request, response, log) {
       respond(response, 400, failure('invalid-body', 'sessionId 与 workspaceId 都必填。'))
       return
     }
-    const report = await moveSession(ctx, sessionId, workspaceId, log)
+    const fileMode = body.files === 'copy' || body.files === 'move' ? body.files : 'none'
+    const report = await moveSession(ctx, sessionId, workspaceId, log, fileMode)
     log('info', `moved ${sessionId}: ${report.from} -> ${report.to}${report.attachOnly === true ? ' (attach only)' : ''}`)
     respond(response, 200, { ok: true, ...report })
   } catch (error) {
